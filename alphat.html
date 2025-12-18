@@ -1,0 +1,1196 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  onAuthStateChanged, 
+  signInWithCustomToken, 
+  signOut,
+  updateProfile
+} from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, where, onSnapshot, orderBy, serverTimestamp } from 'firebase/firestore';
+import { 
+  BookOpen, Brain, Clock, FileText, CheckCircle, Shield, AlertTriangle, 
+  ChevronRight, Menu, X, GraduationCap, Layout, Target, List, 
+  PenTool, Zap, Volume2, StopCircle, Download, LogOut, User
+} from 'lucide-react';
+
+// --- CONFIGURATION & CONSTANTS ---
+
+const SYSTEM_PROMPT = `
+You are ALPHA TUTOR AI. You are a STRICT academic assistant for Class 8-12 students in India.
+CORE DIRECTIVES:
+1. SCOPE: ONLY answer academic questions (Maths, Physics, Chemistry, Biology, Social Science, English) aligned with NCERT/CBSE.
+2. REFUSAL: If a user asks non-academic, casual, or personal questions (e.g., "tell me a joke", "who is the best actor"), respond EXACTLY: "This assistant is strictly for academic and exam-related queries only."
+3. TONE: Formal, disciplined, exam-oriented. NO emojis. NO conversational filler. NO motivational speeches.
+4. FORMAT: Use bullet points, bold keywords, and clear steps.
+5. LEVEL: Adapt complexity to the selected Class (8-12).
+6. MATH/SCIENCE: Provide step-by-step derivations for numericals.
+`;
+
+const SUBJECTS = {
+  8: ['Mathematics', 'Science', 'Social Science', 'English'],
+  9: ['Mathematics', 'Science', 'Social Science', 'English'],
+  10: ['Mathematics', 'Science', 'Social Science', 'English'],
+  11: ['Mathematics', 'Physics', 'Chemistry', 'Biology', 'English', 'Computer Science'],
+  12: ['Mathematics', 'Physics', 'Chemistry', 'Biology', 'English', 'Computer Science'],
+};
+
+// Mock Chapter Data
+const MOCK_CHAPTERS = {
+  'Mathematics': ['Real Numbers', 'Polynomials', 'Quadratic Equations', 'Triangles', 'Coordinate Geometry', 'Trigonometry', 'Circles', 'Probability', 'Calculus (12th)', 'Vectors (12th)'],
+  'Science': ['Chemical Reactions', 'Acids, Bases and Salts', 'Metals and Non-metals', 'Life Processes', 'Light - Reflection and Refraction', 'Electricity', 'Magnetic Effects of Current'],
+  'Physics': ['Units and Measurements', 'Motion in a Straight Line', 'Laws of Motion', 'Work, Energy and Power', 'Gravitation', 'Thermodynamics', 'Electrostatics', 'Current Electricity', 'Optics'],
+  'Chemistry': ['Some Basic Concepts', 'Structure of Atom', 'Chemical Bonding', 'Thermodynamics', 'Equilibrium', 'Redox Reactions', 'Solutions', 'Electrochemistry'],
+  'Biology': ['The Living World', 'Biological Classification', 'Plant Kingdom', 'Animal Kingdom', 'Cell Cycle', 'Photosynthesis', 'Reproduction', 'Genetics', 'Evolution'],
+  'Social Science': ['Rise of Nationalism in Europe', 'Nationalism in India', 'Resources and Development', 'Agriculture', 'Power Sharing', 'Federalism', 'Development', 'Sectors of the Indian Economy'],
+  'English': ['Reading Comprehension', 'Writing Skills', 'Grammar', 'Literature - Prose', 'Literature - Poetry'],
+  'Computer Science': ['Python Basics', 'Data Structures', 'Database Management', 'Computer Networks', 'Boolean Algebra']
+};
+
+// --- FIREBASE SETUP ---
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'alpha-tutor-ai';
+
+// --- API UTILITIES ---
+const generateContent = async (prompt, model = 'gemini-2.5-flash-preview-09-2025') => {
+  const apiKey = ""; // Injected by environment
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] }
+        }),
+      }
+    );
+    if (!response.ok) throw new Error('API Error');
+    const data = await response.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || "Error: No response generated.";
+  } catch (error) {
+    console.error(error);
+    return "System Error: Unable to connect to Alpha Tutor Core.";
+  }
+};
+
+const pcmToWav = (base64PCM) => {
+  const binaryString = atob(base64PCM);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  const wavHeader = new ArrayBuffer(44);
+  const view = new DataView(wavHeader);
+  const writeString = (view, offset, string) => {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  };
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + len, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true); 
+  view.setUint16(20, 1, true); 
+  view.setUint16(22, 1, true); 
+  view.setUint32(24, 24000, true); 
+  view.setUint32(28, 24000 * 2, true); 
+  view.setUint16(32, 2, true); 
+  view.setUint16(34, 16, true); 
+  writeString(view, 36, 'data');
+  view.setUint32(40, len, true);
+  const blob = new Blob([view, bytes], { type: 'audio/wav' });
+  return URL.createObjectURL(blob);
+};
+
+const generateSpeech = async (text) => {
+  const apiKey = "";
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: text }] }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } } }
+          }
+        }),
+      }
+    );
+    if (!response.ok) throw new Error('TTS API Error');
+    const data = await response.json();
+    const pcmData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!pcmData) throw new Error("No audio data");
+    return pcmToWav(pcmData);
+  } catch (error) {
+    console.error("TTS Error:", error);
+    return null;
+  }
+};
+
+// --- HELPER: EXPORT TO DOCS ---
+const downloadAsDoc = (filename, content, title) => {
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>${title}</title>
+      <style>
+        body { font-family: 'Calibri', 'Arial', sans-serif; line-height: 1.6; color: #111; max-width: 800px; margin: 2rem auto; }
+        h1 { color: #1e3a8a; border-bottom: 2px solid #1e3a8a; padding-bottom: 10px; }
+        h2 { color: #1e40af; margin-top: 20px; }
+        strong { color: #000; }
+        ul { margin-bottom: 10px; }
+        li { margin-bottom: 5px; }
+        .footer { margin-top: 40px; font-size: 10px; color: #666; border-top: 1px solid #ccc; padding-top: 10px; }
+      </style>
+    </head>
+    <body>
+      <h1>${title}</h1>
+      <div>${content.replace(/\n/g, '<br/>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')}</div>
+      <div class="footer">Generated by ALPHA TUTOR AI - Academic System</div>
+    </body>
+    </html>
+  `;
+  
+  const blob = new Blob([htmlContent], { type: 'application/msword' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `${filename}.doc`; // .doc triggers Word/Docs import better than .html
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
+// --- COMPONENTS ---
+
+// 1. Navigation & Layout
+const LayoutComponent = ({ children, activeView, setActiveView, user, logout }) => {
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
+  const NavItem = ({ view, icon: Icon, label, highlight }) => (
+    <button
+      onClick={() => { setActiveView(view); setIsSidebarOpen(false); }}
+      className={`w-full flex items-center space-x-3 px-4 py-3 text-sm font-medium transition-colors ${
+        activeView === view 
+          ? 'bg-slate-800 text-white border-r-4 border-blue-500' 
+          : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+      }`}
+    >
+      <Icon size={18} className={highlight ? "text-yellow-400" : ""} />
+      <span className={highlight ? "text-yellow-100 font-bold" : ""}>{label} {highlight && "✨"}</span>
+    </button>
+  );
+
+  return (
+    <div className="flex h-screen bg-slate-50 overflow-hidden font-sans">
+      {/* Sidebar */}
+      <div className={`fixed inset-y-0 left-0 z-50 w-64 bg-slate-900 transform ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 transition-transform duration-200 ease-in-out shadow-xl flex flex-col`}>
+        <div className="p-6 border-b border-slate-800">
+          <div className="flex items-center space-x-2 text-blue-400">
+            <Shield size={24} />
+            <span className="text-xl font-bold tracking-wider text-white">ALPHA TUTOR</span>
+          </div>
+          <p className="text-xs text-slate-500 mt-2 uppercase tracking-widest">Academic AI System</p>
+        </div>
+
+        <nav className="flex-1 py-6 space-y-1 overflow-y-auto">
+          <NavItem view="dashboard" icon={Layout} label="Dashboard" />
+          <NavItem view="questions" icon={List} label="Question Bank" />
+          <NavItem view="mocktest" icon={Clock} label="Mock Tests" />
+          <NavItem view="doubts" icon={Brain} label="Doubt Solver" />
+          <NavItem view="grader" icon={PenTool} label="Answer Grader" highlight={true} />
+          <NavItem view="flashcards" icon={Zap} label="Flashcards" highlight={true} />
+          <NavItem view="notes" icon={FileText} label="Notes Generator" />
+          <NavItem view="planner" icon={Target} label="Study Planner" />
+          <NavItem view="tutor" icon={GraduationCap} label="Tutor Mode" />
+        </nav>
+
+        <div className="p-4 border-t border-slate-800">
+          <div className="flex items-center space-x-2 text-slate-400 mb-4">
+             <User size={16} />
+             <span className="text-xs truncate">{user?.displayName || 'Student User'}</span>
+          </div>
+          <button onClick={logout} className="w-full flex items-center justify-center space-x-2 py-2 bg-red-900/30 text-red-400 hover:bg-red-900/50 hover:text-red-300 text-xs font-bold uppercase tracking-wider rounded transition-colors">
+            <LogOut size={14} />
+            <span>Terminate Session</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col h-full overflow-hidden">
+        <header className="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-6 shadow-sm z-10">
+          <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="md:hidden text-slate-600">
+            <Menu size={24} />
+          </button>
+          <div className="text-sm font-semibold text-slate-600 uppercase tracking-wide">
+            {activeView.replace(/([A-Z])/g, ' $1').trim()}
+          </div>
+          <div className="flex items-center space-x-2">
+            <span className="h-2 w-2 bg-green-500 rounded-full animate-pulse"></span>
+            <span className="text-xs font-bold text-slate-400">SYSTEM ONLINE</span>
+          </div>
+        </header>
+        <main className="flex-1 overflow-y-auto p-4 md:p-8">
+          {children}
+        </main>
+      </div>
+    </div>
+  );
+};
+
+// 2. Dashboard Component
+const Dashboard = ({ setActiveView, userContext, setUserContext }) => {
+  return (
+    <div className="max-w-4xl mx-auto space-y-8">
+      <div className="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+        <h2 className="text-2xl font-bold text-slate-800 mb-2">Academic Configuration</h2>
+        <p className="text-slate-500 mb-6">Set your syllabus context. All AI responses will align with these settings.</p>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div>
+            <label className="block text-xs font-bold text-slate-500 uppercase mb-2">Class</label>
+            <select 
+              value={userContext.classLevel}
+              onChange={(e) => setUserContext({...userContext, classLevel: e.target.value, subject: '', chapter: ''})}
+              className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none text-slate-700 font-medium"
+            >
+              <option value="">Select Class</option>
+              {[8, 9, 10, 11, 12].map(c => <option key={c} value={c}>Class {c}</option>)}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-slate-500 uppercase mb-2">Subject</label>
+            <select 
+              value={userContext.subject}
+              onChange={(e) => setUserContext({...userContext, subject: e.target.value, chapter: ''})}
+              disabled={!userContext.classLevel}
+              className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none text-slate-700 font-medium disabled:bg-slate-100 disabled:text-slate-400"
+            >
+              <option value="">Select Subject</option>
+              {userContext.classLevel && SUBJECTS[userContext.classLevel].map(s => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="md:col-span-2">
+            <label className="block text-xs font-bold text-slate-500 uppercase mb-2">Chapter (NCERT)</label>
+            <select 
+              value={userContext.chapter}
+              onChange={(e) => setUserContext({...userContext, chapter: e.target.value})}
+              disabled={!userContext.subject}
+              className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none text-slate-700 font-medium disabled:bg-slate-100 disabled:text-slate-400"
+            >
+              <option value="">Select Chapter</option>
+              {userContext.subject && (MOCK_CHAPTERS[userContext.subject] || MOCK_CHAPTERS['Mathematics']).map(c => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+              <option value="custom">Other / Full Syllabus</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        {[
+          { title: "Generate Questions", desc: "MCQs, Numericals, Assertion-Reasoning", view: "questions", icon: List },
+          { title: "Doubt Solver", desc: "Strict step-by-step explanations", view: "doubts", icon: Brain },
+          { title: "Mock Test", desc: "Timed full-chapter evaluation", view: "mocktest", icon: Clock },
+          { title: "Revision Notes", desc: "High-yield bullet points", view: "notes", icon: FileText },
+          { title: "AI Answer Grader", desc: "Strict marking & feedback", view: "grader", icon: PenTool, highlight: true },
+          { title: "Smart Flashcards", desc: "Rapid revision tool", view: "flashcards", icon: Zap, highlight: true },
+          { title: "Tutor Mode", desc: "Guided interactive learning", view: "tutor", icon: GraduationCap },
+          { title: "Study Planner", desc: "Optimize your schedule", view: "planner", icon: Target },
+        ].map((item, idx) => (
+          <button 
+            key={idx}
+            onClick={() => setActiveView(item.view)}
+            className={`flex flex-col items-start p-6 bg-white border rounded-lg hover:shadow-md transition-all text-left group ${item.highlight ? 'border-blue-300 ring-1 ring-blue-100' : 'border-slate-200'}`}
+          >
+            <div className={`p-3 rounded-full mb-4 text-slate-700 transition-colors ${item.highlight ? 'bg-yellow-100 text-yellow-700' : 'bg-slate-50 group-hover:bg-blue-50 group-hover:text-blue-600'}`}>
+              <item.icon size={24} />
+            </div>
+            <h3 className="text-lg font-bold text-slate-800 mb-1 flex items-center">
+              {item.title} {item.highlight && <span className="ml-2 text-xs bg-yellow-400 text-white px-1.5 py-0.5 rounded-full">NEW</span>}
+            </h3>
+            <p className="text-sm text-slate-500">{item.desc}</p>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// 3. Question Generator
+const QuestionGenerator = ({ userContext }) => {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [config, setConfig] = useState({ type: 'MCQ', count: 5, difficulty: 'Moderate' });
+
+  const handleGenerate = async () => {
+    if (!userContext.chapter) return alert("Please select a Class, Subject, and Chapter in the Dashboard first.");
+    setLoading(true);
+    const prompt = `Generate ${config.count} ${config.difficulty} level ${config.type} questions for Class ${userContext.classLevel} ${userContext.subject}, Chapter: ${userContext.chapter}. 
+    Include the correct answer and a brief explanation for each. 
+    Format:
+    Q1. [Question]
+    (A) ... (B) ... (C) ... (D) ...
+    Correct: [Option]
+    Explanation: [Text]
+    `;
+    const res = await generateContent(prompt);
+    setResult(res);
+    setLoading(false);
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-6">
+      <div className="bg-white p-6 rounded-lg border border-slate-200 shadow-sm">
+        <h2 className="text-xl font-bold text-slate-800 mb-4 flex items-center">
+          <List className="mr-2" size={20} /> Question Bank Generator
+        </h2>
+        
+        <div className="flex flex-wrap gap-4 mb-6">
+          <select 
+            value={config.type} onChange={(e) => setConfig({...config, type: e.target.value})}
+            className="flex-1 p-2 border rounded bg-slate-50"
+          >
+            <option value="MCQ">Multiple Choice (MCQ)</option>
+            <option value="Assertion-Reason">Assertion & Reason</option>
+            <option value="Numerical">Numerical Problems</option>
+            <option value="Case-based">Case-Based / Passage</option>
+            <option value="Short Answer">Short Answer (2 Marks)</option>
+            <option value="Long Answer">Long Answer (5 Marks)</option>
+          </select>
+          <select 
+            value={config.difficulty} onChange={(e) => setConfig({...config, difficulty: e.target.value})}
+            className="flex-1 p-2 border rounded bg-slate-50"
+          >
+            <option value="Easy">Easy (Board Level)</option>
+            <option value="Moderate">Moderate (Standard)</option>
+            <option value="Hard">Hard (Olympiad/Entrance)</option>
+          </select>
+          <select 
+             value={config.count} onChange={(e) => setConfig({...config, count: e.target.value})}
+             className="w-24 p-2 border rounded bg-slate-50"
+          >
+            <option value="5">5 Qs</option>
+            <option value="10">10 Qs</option>
+            <option value="20">20 Qs</option>
+          </select>
+          <button 
+            onClick={handleGenerate}
+            disabled={loading}
+            className="px-6 py-2 bg-blue-600 text-white font-bold rounded hover:bg-blue-700 disabled:opacity-50"
+          >
+            {loading ? 'Processing...' : 'Generate'}
+          </button>
+        </div>
+
+        {userContext.chapter ? (
+           <div className="text-sm text-slate-500 bg-slate-50 p-2 rounded inline-block">
+             Context: <strong>Class {userContext.classLevel} &bull; {userContext.subject} &bull; {userContext.chapter}</strong>
+           </div>
+        ) : (
+          <div className="flex items-center text-amber-600 bg-amber-50 p-3 rounded">
+            <AlertTriangle size={18} className="mr-2" />
+            Please configure Class and Subject in Dashboard.
+          </div>
+        )}
+      </div>
+
+      {result && (
+        <div className="bg-white p-8 rounded-lg border border-slate-200 shadow-sm relative">
+          <div className="absolute top-8 right-8">
+            <button 
+              onClick={() => downloadAsDoc('Question_Bank', result, `Question Bank: ${userContext.chapter}`)}
+              className="flex items-center space-x-2 text-blue-600 hover:text-blue-800 text-sm font-bold bg-blue-50 px-3 py-2 rounded-lg transition-colors"
+            >
+              <Download size={16} /> <span>Download for Docs</span>
+            </button>
+          </div>
+          <h3 className="text-lg font-bold text-slate-800 mb-4 border-b pb-2">Generated Output</h3>
+          <div className="prose prose-slate max-w-none whitespace-pre-wrap font-serif leading-relaxed text-slate-700">
+            {result}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// 4. Doubt Solver
+const DoubtSolver = ({ userContext }) => {
+  const [queryText, setQueryText] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [answer, setAnswer] = useState(null);
+
+  const handleSolve = async () => {
+    if (!queryText.trim()) return;
+    setLoading(true);
+    const context = userContext.subject ? `Context: Class ${userContext.classLevel} ${userContext.subject}. ` : '';
+    const prompt = `${context}Solve this academic doubt strictly. Provide step-by-step reasoning. Query: ${queryText}`;
+    const res = await generateContent(prompt);
+    setAnswer(res);
+    setLoading(false);
+  };
+
+  return (
+    <div className="max-w-3xl mx-auto space-y-6">
+      <div className="bg-white p-6 rounded-lg border border-slate-200 shadow-sm">
+        <h2 className="text-xl font-bold text-slate-800 mb-2 flex items-center">
+          <Brain className="mr-2" size={20} /> Academic Doubt Resolver
+        </h2>
+        <p className="text-sm text-slate-500 mb-4">
+          Enter your specific question, problem statement, or concept. 
+          Non-academic queries will be rejected automatically.
+        </p>
+        
+        <textarea
+          value={queryText}
+          onChange={(e) => setQueryText(e.target.value)}
+          placeholder="Type your question here (e.g., 'Derive the quadratic formula' or 'Explain the role of xylem')..."
+          className="w-full h-32 p-4 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none resize-none mb-4 font-medium"
+        />
+        
+        <button 
+          onClick={handleSolve}
+          disabled={loading || !queryText}
+          className="w-full py-3 bg-slate-900 text-white font-bold rounded hover:bg-slate-800 disabled:opacity-50 flex justify-center items-center"
+        >
+          {loading ? <span className="animate-spin mr-2">⏳</span> : null}
+          RESOLVE DOUBT
+        </button>
+      </div>
+
+      {answer && (
+        <div className="bg-white p-8 rounded-lg border-l-4 border-blue-600 shadow-sm relative">
+           <div className="absolute top-4 right-4 flex space-x-2">
+            <button 
+               onClick={() => downloadAsDoc('Doubt_Solution', `Q: ${queryText}\n\n${answer}`, 'Alpha Tutor Solution')}
+               className="text-slate-500 hover:text-blue-600 p-2"
+               title="Export to Docs"
+            >
+              <Download size={18} />
+            </button>
+            <button 
+              onClick={() => { navigator.clipboard.writeText(answer); }} 
+              className="text-slate-500 hover:text-blue-600 text-xs font-bold pt-2"
+            >
+              Copy
+            </button>
+          </div>
+          <h3 className="font-bold text-slate-900 uppercase tracking-wide text-sm mb-4">Alpha Tutor Solution</h3>
+          <div className="prose prose-sm max-w-none whitespace-pre-wrap text-slate-800">
+            {answer}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// 5. Notes Generator (WITH TTS & Export)
+const NotesGenerator = ({ userContext }) => {
+  const [loading, setLoading] = useState(false);
+  const [audioLoading, setAudioLoading] = useState(false);
+  const [notes, setNotes] = useState(null);
+  const [audioUrl, setAudioUrl] = useState(null);
+
+  const generateNotes = async () => {
+    if (!userContext.chapter) return alert("Select a chapter in Dashboard first.");
+    setLoading(true);
+    setAudioUrl(null);
+    const prompt = `Create comprehensive, exam-focused revision notes for Class ${userContext.classLevel} ${userContext.subject}, Chapter: ${userContext.chapter}.
+    Structure:
+    1. Key Definitions (Bullet points)
+    2. Important Formulas/Dates/Reactions
+    3. Core Concepts (Concise explanations)
+    4. Common Exam Mistakes to Avoid
+    5. Important Diagrams (Describe what to draw)
+    `;
+    const res = await generateContent(prompt);
+    setNotes(res);
+    setLoading(false);
+  };
+
+  const handleTTS = async () => {
+    if (!notes) return;
+    setAudioLoading(true);
+    const ttsText = "Here are your revision notes. " + notes.substring(0, 800) + "...";
+    const url = await generateSpeech(ttsText);
+    if (url) {
+      setAudioUrl(url);
+    } else {
+      alert("Failed to generate audio.");
+    }
+    setAudioLoading(false);
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto h-full flex flex-col">
+      <div className="bg-white p-6 rounded-lg border border-slate-200 shadow-sm mb-6 flex justify-between items-center">
+        <div>
+          <h2 className="text-xl font-bold text-slate-800 flex items-center">
+            <FileText className="mr-2" size={20} /> Smart Notes Generator
+          </h2>
+          <p className="text-sm text-slate-500 mt-1">
+             Current Scope: {userContext.classLevel ? `Class ${userContext.classLevel} • ${userContext.subject} • ${userContext.chapter}` : 'No Chapter Selected'}
+          </p>
+        </div>
+        <button 
+          onClick={generateNotes}
+          disabled={loading || !userContext.chapter}
+          className="px-6 py-3 bg-blue-600 text-white font-bold rounded hover:bg-blue-700 disabled:bg-slate-300"
+        >
+          {loading ? 'Generating...' : 'Create Notes'}
+        </button>
+      </div>
+
+      {notes ? (
+        <div className="flex-1 bg-white p-8 rounded-lg border border-slate-200 shadow-sm overflow-y-auto relative">
+          <div className="flex justify-end space-x-2 mb-6">
+             <button 
+                onClick={() => downloadAsDoc('Revision_Notes', notes, `Notes: ${userContext.chapter}`)}
+                className="flex items-center space-x-2 px-4 py-2 bg-white text-slate-700 rounded-full hover:bg-slate-50 text-sm font-bold border border-slate-300 shadow-sm"
+              >
+                <Download size={16} /> <span>Export to Docs</span>
+              </button>
+            {!audioUrl ? (
+              <button 
+                onClick={handleTTS}
+                disabled={audioLoading}
+                className="flex items-center space-x-2 px-4 py-2 bg-slate-100 text-slate-700 rounded-full hover:bg-slate-200 text-sm font-bold border border-slate-300"
+              >
+                {audioLoading ? (
+                  <><span>Generating Audio...</span></>
+                ) : (
+                  <><Volume2 size={16} /> <span>Listen to Notes ✨</span></>
+                )}
+              </button>
+            ) : (
+              <audio controls src={audioUrl} className="h-10 w-64" autoPlay />
+            )}
+          </div>
+          <div className="prose prose-slate max-w-none whitespace-pre-wrap">
+            {notes}
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 flex flex-col items-center justify-center text-slate-400 border-2 border-dashed border-slate-200 rounded-lg">
+          <FileText size={48} className="mb-4 opacity-50" />
+          <p>Notes will appear here generated strictly from NCERT syllabus.</p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- NEW FEATURE: ANSWER GRADER ---
+const AnswerGrader = ({ userContext }) => {
+  const [question, setQuestion] = useState('');
+  const [answer, setAnswer] = useState('');
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleGrade = async () => {
+    if (!question.trim() || !answer.trim()) return alert("Please enter both question and answer.");
+    setLoading(true);
+    
+    const prompt = `
+      Act as a STRICT CBSE Board Examiner.
+      Subject: ${userContext.subject || 'General Academic'}
+      Class: ${userContext.classLevel || 'General'}
+      
+      Question: "${question}"
+      Student Answer: "${answer}"
+      
+      Task:
+      1. Grade this answer out of 5 marks.
+      2. Identify missing KEYWORDS (crucial for CBSE).
+      3. Rewrite the answer perfectly.
+      
+      Format your response like this:
+      **Score: X/5**
+      **Verdict:** (Strict, Moderate, Lenient)
+      
+      **Analysis:**
+      - Good points: ...
+      - Missing Keywords: ...
+      
+      **Model Answer (Full Marks):**
+      ...
+    `;
+
+    const res = await generateContent(prompt);
+    setResult(res);
+    setLoading(false);
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-6">
+      <div className="bg-white p-6 rounded-lg border border-slate-200 shadow-sm">
+        <h2 className="text-xl font-bold text-slate-800 mb-2 flex items-center">
+          <PenTool className="mr-2" size={20} /> AI Answer Grader ✨
+        </h2>
+        <p className="text-sm text-slate-500 mb-6">
+          Paste a question and your practice answer. The AI will grade it strictly based on board exam marking schemes.
+        </p>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-bold text-slate-700 mb-1">Question</label>
+            <input 
+              className="w-full p-3 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none font-medium"
+              placeholder="e.g., Explain the process of double circulation in humans."
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-bold text-slate-700 mb-1">Your Answer</label>
+            <textarea 
+              className="w-full p-3 h-32 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none font-medium resize-none"
+              placeholder="Type your answer here..."
+              value={answer}
+              onChange={(e) => setAnswer(e.target.value)}
+            />
+          </div>
+          <button 
+            onClick={handleGrade}
+            disabled={loading}
+            className="w-full py-3 bg-indigo-600 text-white font-bold rounded hover:bg-indigo-700 transition-colors flex justify-center items-center"
+          >
+            {loading ? 'Evaluating...' : 'Evaluate Answer ✨'}
+          </button>
+        </div>
+      </div>
+
+      {result && (
+        <div className="bg-white p-8 rounded-lg border-l-4 border-indigo-500 shadow-sm animate-in fade-in slide-in-from-bottom-4 duration-500 relative">
+          <button 
+            onClick={() => downloadAsDoc('Graded_Evaluation', `Question: ${question}\n\nStudent Answer: ${answer}\n\n${result}`, 'AI Evaluation Report')}
+            className="absolute top-4 right-4 text-slate-500 hover:text-indigo-600 p-2"
+            title="Export Report"
+          >
+            <Download size={20} />
+          </button>
+          <div className="prose prose-slate max-w-none whitespace-pre-wrap">
+            {result}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- NEW FEATURE: FLASHCARDS ---
+const Flashcards = ({ userContext }) => {
+  const [cards, setCards] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [flipped, setFlipped] = useState({});
+
+  const generateCards = async () => {
+    if (!userContext.chapter) return alert("Select a chapter in Dashboard.");
+    setLoading(true);
+    setCards([]);
+    const prompt = `
+      Generate 6 revision flashcards for Class ${userContext.classLevel} ${userContext.subject}, Chapter: ${userContext.chapter}.
+      Format strictly as JSON array:
+      [{"term": "Term 1", "def": "Definition 1"}, ...]
+      Keep definitions short (under 20 words).
+    `;
+    
+    try {
+      const text = await generateContent(prompt + " Return only the JSON.");
+      const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+      setCards(JSON.parse(cleanText));
+    } catch (e) {
+      alert("Error generating cards. Try again.");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-6">
+      <div className="bg-white p-6 rounded-lg border border-slate-200 shadow-sm flex justify-between items-center">
+         <div>
+          <h2 className="text-xl font-bold text-slate-800 flex items-center">
+            <Zap className="mr-2" size={20} /> Smart Flashcards ✨
+          </h2>
+          <p className="text-sm text-slate-500">Rapid fire revision for key terms and formulas.</p>
+        </div>
+        <button 
+          onClick={generateCards}
+          disabled={loading || !userContext.chapter}
+          className="px-6 py-3 bg-orange-500 text-white font-bold rounded hover:bg-orange-600"
+        >
+          {loading ? 'Generating...' : 'Generate Cards ✨'}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {cards.map((card, idx) => (
+          <div 
+            key={idx}
+            onClick={() => setFlipped(prev => ({...prev, [idx]: !prev[idx]}))}
+            className="h-48 cursor-pointer perspective-1000 group"
+          >
+            <div className={`relative w-full h-full transition-all duration-500 transform-style-3d ${flipped[idx] ? 'rotate-y-180' : ''}`}>
+              {/* Front */}
+              <div className={`absolute w-full h-full bg-white border border-slate-200 rounded-xl p-6 flex items-center justify-center text-center shadow-sm backface-hidden ${flipped[idx] ? 'hidden' : 'block'}`}>
+                <div>
+                  <div className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">TERM</div>
+                  <h3 className="text-xl font-bold text-slate-800">{card.term}</h3>
+                  <p className="text-xs text-slate-400 mt-4">Tap to flip</p>
+                </div>
+              </div>
+              {/* Back */}
+              <div className={`absolute w-full h-full bg-slate-800 rounded-xl p-6 flex items-center justify-center text-center shadow-sm backface-hidden rotate-y-180 ${flipped[idx] ? 'block' : 'hidden'}`}>
+                <div>
+                   <div className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">DEFINITION</div>
+                   <p className="text-white font-medium">{card.def}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// 6. Tutor Mode
+const TutorMode = ({ userContext }) => {
+  const [messages, setMessages] = useState([
+    { role: 'ai', text: "Tutor Mode Active. I will teach you topic-by-topic. What specific topic from the chapter would you like to start with?" }
+  ]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages]);
+
+  const handleSend = async () => {
+    if (!input.trim()) return;
+    const userMsg = input;
+    setInput('');
+    setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+    setLoading(true);
+
+    const history = messages.map(m => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.text}`).join('\n');
+    const prompt = `
+      Context: Class ${userContext.classLevel} ${userContext.subject} ${userContext.chapter}.
+      Role: Strict Academic Tutor.
+      History:
+      ${history}
+      Student: ${userMsg}
+      
+      Instruction: 
+      1. Explain the concept briefly (max 100 words).
+      2. Immediately ask a conceptual question to test understanding.
+      3. Do not move to the next topic until the student answers correctly.
+    `;
+
+    const res = await generateContent(prompt);
+    setMessages(prev => [...prev, { role: 'ai', text: res }]);
+    setLoading(false);
+  };
+
+  return (
+    <div className="max-w-3xl mx-auto h-[calc(100vh-8rem)] flex flex-col bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+      <div className="p-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+        <h3 className="font-bold text-slate-800 flex items-center">
+          <GraduationCap className="mr-2" size={18} /> Interactive Tutor
+          <button 
+             onClick={() => downloadAsDoc('Tutor_Transcript', messages.map(m => `${m.role.toUpperCase()}: ${m.text}`).join('\n\n'), 'Tutor Session Transcript')}
+             className="ml-4 text-slate-400 hover:text-blue-600"
+          >
+            <Download size={14} />
+          </button>
+        </h3>
+        <span className="text-xs font-semibold bg-green-100 text-green-700 px-2 py-1 rounded">LIVE SESSION</span>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-4" ref={scrollRef}>
+        {messages.map((m, i) => (
+          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[80%] p-4 rounded-lg text-sm leading-relaxed whitespace-pre-wrap ${
+              m.role === 'user' 
+                ? 'bg-slate-800 text-white rounded-br-none' 
+                : 'bg-slate-100 text-slate-800 rounded-bl-none border border-slate-200'
+            }`}>
+              {m.text}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div className="flex justify-start">
+            <div className="bg-slate-50 p-3 rounded-lg text-slate-500 text-xs animate-pulse">
+              Tutor is typing...
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="p-4 border-t border-slate-200 bg-white">
+        <div className="flex space-x-2">
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+            placeholder="Type your answer or topic..."
+            className="flex-1 p-3 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none"
+          />
+          <button 
+            onClick={handleSend}
+            disabled={loading}
+            className="px-6 bg-blue-600 text-white font-bold rounded hover:bg-blue-700"
+          >
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// 7. Mock Test (Simplified)
+const MockTest = ({ userContext }) => {
+  const [state, setState] = useState('setup'); // setup, test, result
+  const [questions, setQuestions] = useState([]);
+  const [answers, setAnswers] = useState({});
+  const [score, setScore] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const startTest = async () => {
+    if (!userContext.chapter) return alert("Configure Dashboard first.");
+    setLoading(true);
+    const prompt = `Generate 5 multiple choice questions for a Mock Test. 
+    Class ${userContext.classLevel} ${userContext.subject} Chapter ${userContext.chapter}.
+    Strictly follow this JSON format ONLY:
+    [
+      { "id": 1, "q": "Question text", "options": ["A", "B", "C", "D"], "correct": 0, "exp": "Explanation" },
+      ...
+    ]
+    Make sure options are just the text values.
+    `;
+    try {
+        const text = await generateContent(prompt + " Return only the JSON array.");
+        const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        const data = JSON.parse(cleanText);
+        setQuestions(data);
+        setState('test');
+    } catch (e) {
+        alert("Error generating test. Please try again. The AI output was not valid JSON.");
+        console.error(e);
+    }
+    setLoading(false);
+  };
+
+  const submitTest = () => {
+    let correct = 0;
+    questions.forEach((q, idx) => {
+      if (answers[idx] === q.correct) correct++;
+    });
+    setScore(correct);
+    setState('result');
+  };
+
+  if (state === 'setup') {
+    return (
+      <div className="max-w-xl mx-auto text-center mt-10 p-8 bg-white rounded-lg border border-slate-200 shadow-sm">
+        <Clock size={48} className="mx-auto text-blue-500 mb-4" />
+        <h2 className="text-2xl font-bold text-slate-800 mb-2">Rapid Fire Mock Test</h2>
+        <p className="text-slate-500 mb-6">
+          5 Questions • 10 Minutes • Instant Evaluation
+          <br/>
+          Scope: {userContext.chapter || "No chapter selected"}
+        </p>
+        <button 
+          onClick={startTest} 
+          disabled={loading || !userContext.chapter}
+          className="w-full py-3 bg-blue-600 text-white font-bold rounded hover:bg-blue-700 disabled:opacity-50"
+        >
+          {loading ? 'Preparing Test Paper...' : 'Start Examination'}
+        </button>
+      </div>
+    );
+  }
+
+  if (state === 'test') {
+    return (
+      <div className="max-w-3xl mx-auto bg-white p-8 rounded-lg border border-slate-200 shadow-sm">
+        <div className="flex justify-between items-center mb-6 border-b pb-4">
+          <h2 className="text-xl font-bold text-slate-800">Mock Test: {userContext.chapter}</h2>
+          <div className="bg-red-50 text-red-600 px-3 py-1 rounded text-sm font-bold flex items-center">
+            <Clock size={16} className="mr-2" /> Live
+          </div>
+        </div>
+        <div className="space-y-8">
+          {questions.map((q, idx) => (
+            <div key={q.id}>
+              <p className="font-medium text-slate-900 mb-3">{idx + 1}. {q.q}</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {q.options.map((opt, optIdx) => (
+                  <button
+                    key={optIdx}
+                    onClick={() => setAnswers({...answers, [idx]: optIdx})}
+                    className={`p-3 text-left rounded border ${
+                      answers[idx] === optIdx 
+                        ? 'bg-blue-600 text-white border-blue-600' 
+                        : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    {String.fromCharCode(65 + optIdx)}. {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <button 
+          onClick={submitTest}
+          className="mt-8 w-full py-4 bg-green-600 text-white font-bold rounded hover:bg-green-700"
+        >
+          Submit Test
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto bg-white p-8 rounded-lg border border-slate-200 shadow-sm">
+      <div className="text-center mb-8">
+        <h2 className="text-3xl font-bold text-slate-800 mb-2">Result Analysis</h2>
+        <div className="text-6xl font-black text-blue-600 mb-2">{score} / {questions.length}</div>
+        <p className="text-slate-500">Scorecard generated</p>
+      </div>
+      
+      <div className="space-y-6">
+        {questions.map((q, idx) => (
+          <div key={q.id} className={`p-4 rounded border ${answers[idx] === q.correct ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
+            <p className="font-bold text-slate-900 mb-2">Q{idx+1}: {q.q}</p>
+            <p className="text-sm mb-1"><span className="font-bold">Your Answer:</span> {q.options[answers[idx]] || "Skipped"}</p>
+            <p className="text-sm mb-2"><span className="font-bold">Correct Answer:</span> {q.options[q.correct]}</p>
+            <p className="text-xs text-slate-600 italic bg-white p-2 rounded">Explanation: {q.exp}</p>
+          </div>
+        ))}
+      </div>
+      <button onClick={() => setState('setup')} className="mt-6 px-6 py-2 bg-slate-800 text-white rounded">Back to Tests</button>
+    </div>
+  );
+};
+
+// 8. Study Planner
+const StudyPlanner = ({ user, userContext }) => {
+  const [plans, setPlans] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!user) return;
+    const q = query(collection(db, 'artifacts', appId, 'users', user.uid, 'studyplans'), orderBy('createdAt', 'desc'));
+    const unsub = onSnapshot(q, (snap) => {
+      setPlans(snap.docs.map(d => ({id: d.id, ...d.data()})));
+    }, (err) => console.error(err));
+    return () => unsub();
+  }, [user]);
+
+  const createPlan = async () => {
+    if (!userContext.classLevel) return alert("Select Class first.");
+    setLoading(true);
+    const prompt = `Create a 3-day rigorous study plan for a Class ${userContext.classLevel} student focusing on ${userContext.subject || 'All Subjects'}.
+    Format: Day 1 (Topic - Duration), Day 2...
+    Be realistic but disciplined.
+    `;
+    const text = await generateContent(prompt);
+    
+    await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'studyplans'), {
+      text,
+      createdAt: serverTimestamp(),
+      subject: userContext.subject || 'General'
+    });
+    setLoading(false);
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-6">
+      <div className="bg-white p-6 rounded-lg border border-slate-200 shadow-sm flex justify-between items-center">
+        <div>
+          <h2 className="text-xl font-bold text-slate-800">Smart Study Planner</h2>
+          <p className="text-sm text-slate-500">AI-generated schedules based on your class context.</p>
+        </div>
+        <button 
+          onClick={createPlan}
+          disabled={loading}
+          className="px-6 py-3 bg-purple-600 text-white font-bold rounded hover:bg-purple-700"
+        >
+          {loading ? 'Generating...' : 'Create New Plan'}
+        </button>
+      </div>
+
+      <div className="grid gap-4">
+        {plans.map(plan => (
+          <div key={plan.id} className="bg-white p-6 rounded-lg border border-slate-200 shadow-sm relative">
+             <button 
+                onClick={() => downloadAsDoc('Study_Plan', plan.text, `Study Plan: ${plan.subject}`)}
+                className="absolute top-6 right-6 text-slate-400 hover:text-blue-600"
+            >
+                <Download size={18} />
+            </button>
+            <div className="flex justify-between mb-4">
+                <span className="text-xs font-bold text-purple-600 uppercase bg-purple-50 px-2 py-1 rounded">
+                    {plan.subject}
+                </span>
+                <span className="text-xs text-slate-400 mr-8">
+                    {plan.createdAt?.toDate ? plan.createdAt.toDate().toLocaleDateString() : 'Just now'}
+                </span>
+            </div>
+            <div className="prose prose-sm max-w-none whitespace-pre-wrap text-slate-700">
+              {plan.text}
+            </div>
+          </div>
+        ))}
+        {plans.length === 0 && (
+          <div className="text-center py-10 text-slate-400">No study plans created yet.</div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// 9. Auth Page (Login/Signup)
+const AuthPage = () => {
+  const [name, setName] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try {
+      // Use Anonymous Auth (Allowed in this env) but simulated as a Login
+      const result = await signInAnonymously(auth);
+      if (name) {
+        // Save the student name for display
+        await updateProfile(result.user, { displayName: name });
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col justify-center items-center p-4">
+      <div className="max-w-md w-full bg-white p-8 rounded-xl shadow-xl border border-slate-200">
+        <div className="flex justify-center mb-6">
+          <div className="bg-blue-600 p-4 rounded-full text-white shadow-lg">
+            <Shield size={40} />
+          </div>
+        </div>
+        <h1 className="text-3xl font-black text-center text-slate-900 mb-2 tracking-tight">ALPHA TUTOR AI</h1>
+        <p className="text-center text-slate-500 mb-8 font-medium">
+          Access the Academic System
+        </p>
+
+        <form onSubmit={handleAuth} className="space-y-4">
+          <div>
+            <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Student Name</label>
+            <input 
+              type="text" 
+              required 
+              value={name}
+              onChange={e => setName(e.target.value)}
+              className="w-full p-3 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none"
+              placeholder="Enter your full name"
+            />
+          </div>
+          
+          {error && <div className="text-red-500 text-xs bg-red-50 p-2 rounded">{error}</div>}
+
+          <button 
+            type="submit" 
+            disabled={loading}
+            className="w-full py-4 bg-slate-900 text-white font-bold text-lg rounded-lg hover:bg-slate-800 transition-colors flex items-center justify-center group"
+          >
+            {loading ? 'Authenticating...' : 'Enter System'} 
+            {!loading && <ChevronRight className="ml-2 group-hover:translate-x-1 transition-transform" />}
+          </button>
+        </form>
+        
+        <div className="mt-4 text-center">
+            <p className="text-xs text-slate-400">
+                Note: This preview environment uses guest authentication. 
+                Your progress is saved for this session.
+            </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- MAIN APP ---
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [activeView, setActiveView] = useState('dashboard');
+  const [userContext, setUserContext] = useState({ classLevel: '', subject: '', chapter: '' });
+
+  useEffect(() => {
+    const initAuth = async () => {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInWithCustomToken(auth, __initial_auth_token);
+        }
+        // If no custom token, we wait for user to use the AuthPage
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthChecked(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const handleLogout = () => signOut(auth);
+
+  if (!authChecked) return <div className="flex h-screen items-center justify-center bg-slate-50 text-slate-400">Loading System...</div>;
+
+  if (!user) return <AuthPage />;
+
+  return (
+    <LayoutComponent activeView={activeView} setActiveView={setActiveView} user={user} logout={handleLogout}>
+      {activeView === 'dashboard' && <Dashboard setActiveView={setActiveView} userContext={userContext} setUserContext={setUserContext} />}
+      {activeView === 'questions' && <QuestionGenerator userContext={userContext} />}
+      {activeView === 'doubts' && <DoubtSolver userContext={userContext} />}
+      {activeView === 'notes' && <NotesGenerator userContext={userContext} />}
+      {activeView === 'tutor' && <TutorMode userContext={userContext} />}
+      {activeView === 'mocktest' && <MockTest userContext={userContext} />}
+      {activeView === 'planner' && <StudyPlanner user={user} userContext={userContext} />}
+      {activeView === 'grader' && <AnswerGrader userContext={userContext} />}
+      {activeView === 'flashcards' && <Flashcards userContext={userContext} />}
+    </LayoutComponent>
+  );
+};
+
+export default App;
